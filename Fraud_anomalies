@@ -1,0 +1,273 @@
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import *
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression
+import math
+
+def detect_anomalies_and_trends(df: DataFrame, date_col: str = 'date') -> DataFrame:
+    # Extract day of week
+    df = df.withColumn("day_of_week", date_format(col(date_col), "u").cast("int"))  # 1=Monday, 7=Sunday
+
+    # Split historical (first 30 days) and target (31st day)
+    window_spec = Window.orderBy(col(date_col))
+    df = df.withColumn("rank", row_number().over(window_spec))
+    df_hist = df.filter(col("rank") <= 30).drop("rank")
+    df_target = df.filter(col("rank") == 31).drop("rank")
+
+    # Identify column types
+    numerical_cols = [field.name for field in df.schema.fields if str(field.dataType) in ['IntegerType', 'DoubleType', 'FloatType', 'LongType'] and field.name not in [date_col, "day_of_week", "rank"]]
+    categorical_cols = [field.name for field in df.schema.fields if str(field.dataType) == 'StringType']
+
+    # ========== NUMERICAL ANALYSIS ==========
+    stats_exprs = []
+    for col_name in numerical_cols:
+        stats_exprs.append(mean(col_name).alias(f"{col_name}_mean"))
+        stats_exprs.append(stddev(col_name).alias(f"{col_name}_stddev"))
+
+    stats_df = df_hist.agg(*stats_exprs)
+    stats_dict = stats_df.collect()[0].asDict()
+
+    # Add z-score columns to 31st day data
+    for col_name in numerical_cols:
+        mean_val = stats_dict.get(f"{col_name}_mean", 0.0)
+        stddev_val = stats_dict.get(f"{col_name}_stddev", 1.0)
+        stddev_val = stddev_val if stddev_val != 0 else 1.0  # avoid division by zero
+        z_col = f"{col_name}_zscore"
+        df_target = df_target.withColumn(z_col, (col(col_name) - mean_val) / stddev_val)
+        df_target = df_target.withColumn(f"{col_name}_anomaly_score", abs(col(z_col)))
+
+    # ========== TREND ANALYSIS (NUMERICAL) ==========
+    trend_scores = []
+    for col_name in numerical_cols:
+        time_df = df_hist.select(date_format(col(date_col), 'yyyy-MM-dd').alias("date_str"), col(col_name))
+        time_df = time_df.withColumn("day_idx", row_number().over(Window.orderBy("date_str")))
+
+        assembler = VectorAssembler(inputCols=["day_idx"], outputCol="features")
+        time_df = assembler.transform(time_df).select("features", col_name)
+
+        lr = LinearRegression(featuresCol="features", labelCol=col_name)
+        model = lr.fit(time_df)
+        slope = model.coefficients[0]
+
+        # Add trend score to target
+        trend_scores.append((col_name, slope))
+
+    # Add trend scores as columns
+    for col_name, slope in trend_scores:
+        df_target = df_target.withColumn(f"{col_name}_trend_score", lit(slope))
+
+    # ========== CATEGORICAL ANALYSIS ==========
+    for cat_col in categorical_cols:
+        hist_freq = (
+            df_hist.groupBy(cat_col)
+            .count()
+            .withColumnRenamed("count", f"{cat_col}_hist_count")
+        )
+
+        target_freq = (
+            df_target.groupBy(cat_col)
+            .count()
+            .withColumnRenamed("count", f"{cat_col}_target_count")
+        )
+
+        cat_joined = hist_freq.join(target_freq, on=cat_col, how="outer").fillna(0)
+        total_hist = df_hist.count()
+        total_target = df_target.count()
+
+        cat_joined = cat_joined.withColumn(f"{cat_col}_freq_diff", 
+            abs((col(f"{cat_col}_target_count") / total_target) - (col(f"{cat_col}_hist_count") / total_hist))
+        )
+
+        # Join frequency diff to df_target
+        df_target = df_target.join(cat_joined.select(cat_col, f"{cat_col}_freq_diff"), on=cat_col, how="left")
+
+    # ========== FINAL SCORE AGGREGATION ==========
+    anomaly_score_exprs = [col(f"{c}_anomaly_score") for c in numerical_cols]
+    trend_score_exprs = [col(f"{c}_trend_score") for c in numerical_cols]
+    cat_score_exprs = [col(f"{c}_freq_diff") for c in categorical_cols]
+
+    df_target = df_target.withColumn(
+        "total_anomaly_score",
+        sum(anomaly_score_exprs + cat_score_exprs)
+    )
+
+    df_target = df_target.withColumn(
+        "total_trend_score",
+        sum(trend_score_exprs)
+    )
+
+    return df_target
+
+
+
+
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import *
+from pyspark.ml.feature import VectorAssembler, StringIndexer
+from pyspark.ml.regression import LinearRegression
+from synapse.ml.isolationforest import IsolationForest
+from typing import List
+
+def detect_anomalies_and_trends_ml(df: DataFrame, date_col: str = "date") -> DataFrame:
+    # Add day of week
+    df = df.withColumn("day_of_week", date_format(col(date_col), "u").cast("int"))
+
+    # Sort and split historical and current (31st day)
+    window_spec = Window.orderBy(col(date_col))
+    df = df.withColumn("rank", row_number().over(window_spec))
+    df_hist = df.filter(col("rank") <= 30).drop("rank")
+    df_target = df.filter(col("rank") == 31).drop("rank")
+
+    # Identify columns
+    numerical_cols = [field.name for field in df.schema.fields if str(field.dataType) in ['IntegerType', 'DoubleType', 'FloatType', 'LongType'] and field.name not in [date_col, "day_of_week", "rank"]]
+    categorical_cols = [field.name for field in df.schema.fields if str(field.dataType) == 'StringType']
+
+    # ========== CATEGORICAL ANOMALY ANALYSIS ==========
+    for cat_col in categorical_cols:
+        hist_cats = df_hist.select(cat_col).distinct().withColumnRenamed(cat_col, "hist_cat")
+        df_target = df_target.withColumn(f"{cat_col}_is_unseen", ~col(cat_col).isin([r["hist_cat"] for r in hist_cats.collect()]).cast("int"))
+
+    # ========== TREND DETECTION FOR NUMERIC FEATURES ==========
+    trend_scores = []
+    for col_name in numerical_cols:
+        time_df = df_hist.select(date_format(col(date_col), 'yyyy-MM-dd').alias("date_str"), col(col_name))
+        time_df = time_df.withColumn("day_idx", row_number().over(Window.orderBy("date_str")))
+
+        assembler = VectorAssembler(inputCols=["day_idx"], outputCol="features")
+        time_df = assembler.transform(time_df).select("features", col_name)
+
+        lr = LinearRegression(featuresCol="features", labelCol=col_name)
+        model = lr.fit(time_df)
+        slope = model.coefficients[0]
+
+        # Add trend score
+        df_target = df_target.withColumn(f"{col_name}_trend_score", lit(slope))
+        trend_scores.append(f"{col_name}_trend_score")
+
+    # ========== ISOLATION FOREST FOR NUMERICAL ANOMALY DETECTION ==========
+    # Assemble vector features
+    assembler = VectorAssembler(inputCols=numerical_cols, outputCol="features")
+    hist_vector = assembler.transform(df_hist).select("features")
+    target_vector = assembler.transform(df_target).select(*df_target.columns, "features")
+
+    # Train Isolation Forest
+    iso_forest = IsolationForest(contamination=0.1, featuresCol="features", predictionCol="anomaly", anomalyScoreCol="anomaly_score")
+    model = iso_forest.fit(hist_vector)
+
+    # Apply to 31st day
+    target_scored = model.transform(target_vector)
+
+    # ========== FINAL SCORING ==========
+    # Total trend score
+    target_scored = target_scored.withColumn("total_trend_score", sum([col(t) for t in trend_scores]))
+
+    # Total anomaly score
+    cat_anomaly_flags = [col(f"{c}_is_unseen").cast("double") for c in categorical_cols]
+    target_scored = target_scored.withColumn("total_categorical_anomaly", sum(cat_anomaly_flags))
+    target_scored = target_scored.withColumn("total_anomaly_score", col("anomaly_score") + col("total_categorical_anomaly"))
+
+    return target_scored
+
+
+
+
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import *
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import LinearRegression
+import math
+
+def detect_anomalies_and_trends(df: DataFrame, date_col: str = 'date') -> DataFrame:
+    # Extract day of week
+    df = df.withColumn("day_of_week", date_format(col(date_col), "u").cast("int"))  # 1=Monday, 7=Sunday
+
+    # Split historical (first 30 days) and target (31st day)
+    window_spec = Window.orderBy(col(date_col))
+    df = df.withColumn("rank", row_number().over(window_spec))
+    df_hist = df.filter(col("rank") <= 30).drop("rank")
+    df_target = df.filter(col("rank") == 31).drop("rank")
+
+    # Identify column types
+    numerical_cols = [field.name for field in df.schema.fields if str(field.dataType) in ['IntegerType', 'DoubleType', 'FloatType', 'LongType'] and field.name not in [date_col, "day_of_week", "rank"]]
+    categorical_cols = [field.name for field in df.schema.fields if str(field.dataType) == 'StringType']
+
+    # ========== NUMERICAL ANALYSIS ==========
+    stats_exprs = []
+    for col_name in numerical_cols:
+        stats_exprs.append(mean(col_name).alias(f"{col_name}_mean"))
+        stats_exprs.append(stddev(col_name).alias(f"{col_name}_stddev"))
+
+    stats_df = df_hist.agg(*stats_exprs)
+    stats_dict = stats_df.collect()[0].asDict()
+
+    # Add z-score columns to 31st day data
+    for col_name in numerical_cols:
+        mean_val = stats_dict.get(f"{col_name}_mean", 0.0)
+        stddev_val = stats_dict.get(f"{col_name}_stddev", 1.0)
+        stddev_val = stddev_val if stddev_val != 0 else 1.0  # avoid division by zero
+        z_col = f"{col_name}_zscore"
+        df_target = df_target.withColumn(z_col, (col(col_name) - mean_val) / stddev_val)
+        df_target = df_target.withColumn(f"{col_name}_anomaly_score", abs(col(z_col)))
+
+    # ========== TREND ANALYSIS (NUMERICAL) ==========
+    trend_scores = []
+    for col_name in numerical_cols:
+        time_df = df_hist.select(date_format(col(date_col), 'yyyy-MM-dd').alias("date_str"), col(col_name))
+        time_df = time_df.withColumn("day_idx", row_number().over(Window.orderBy("date_str")))
+
+        assembler = VectorAssembler(inputCols=["day_idx"], outputCol="features")
+        time_df = assembler.transform(time_df).select("features", col_name)
+
+        lr = LinearRegression(featuresCol="features", labelCol=col_name)
+        model = lr.fit(time_df)
+        slope = model.coefficients[0]
+
+        # Add trend score to target
+        trend_scores.append((col_name, slope))
+
+    # Add trend scores as columns
+    for col_name, slope in trend_scores:
+        df_target = df_target.withColumn(f"{col_name}_trend_score", lit(slope))
+
+    # ========== CATEGORICAL ANALYSIS ==========
+    for cat_col in categorical_cols:
+        hist_freq = (
+            df_hist.groupBy(cat_col)
+            .count()
+            .withColumnRenamed("count", f"{cat_col}_hist_count")
+        )
+
+        target_freq = (
+            df_target.groupBy(cat_col)
+            .count()
+            .withColumnRenamed("count", f"{cat_col}_target_count")
+        )
+
+        cat_joined = hist_freq.join(target_freq, on=cat_col, how="outer").fillna(0)
+        total_hist = df_hist.count()
+        total_target = df_target.count()
+
+        cat_joined = cat_joined.withColumn(f"{cat_col}_freq_diff", 
+            abs((col(f"{cat_col}_target_count") / total_target) - (col(f"{cat_col}_hist_count") / total_hist))
+        )
+
+        # Join frequency diff to df_target
+        df_target = df_target.join(cat_joined.select(cat_col, f"{cat_col}_freq_diff"), on=cat_col, how="left")
+
+    # ========== FINAL SCORE AGGREGATION ==========
+    anomaly_score_exprs = [col(f"{c}_anomaly_score") for c in numerical_cols]
+    trend_score_exprs = [col(f"{c}_trend_score") for c in numerical_cols]
+    cat_score_exprs = [col(f"{c}_freq_diff") for c in categorical_cols]
+
+    df_target = df_target.withColumn(
+        "total_anomaly_score",
+        sum(anomaly_score_exprs + cat_score_exprs)
+    )
+
+    df_target = df_target.withColumn(
+        "total_trend_score",
+        sum(trend_score_exprs)
+    )
+
+    return df_target
